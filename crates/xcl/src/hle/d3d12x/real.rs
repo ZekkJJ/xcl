@@ -3988,8 +3988,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+        if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, dxil.len())) {
             driver_cache::keep(p, &b, in_driver);
         }
     } else if reused && from_disk {
@@ -4266,6 +4265,27 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+
+    /// A blob the in-memory store has no room for still goes back to its caller (which writes
+    /// it to the disk cache); one that fits is kept in memory as well.
+    #[test]
+    fn a_blob_over_the_memory_budget_still_reaches_its_caller() {
+        let mut store = (super::HashMap::new(), 0usize);
+        let fits = super::remember_compute_blob(&mut store, (1, 2, 0), vec![7u8; 64]).expect("a blob that fits");
+        assert_eq!(fits.len(), 64);
+        assert_eq!(store.1, 64);
+        assert!(store.0.contains_key(&(1, 2, 0)));
+
+        // the store is full: nothing more is kept in memory …
+        store.1 = super::COMPUTE_BLOBS_MAX;
+        let over = super::remember_compute_blob(&mut store, (3, 4, 0), vec![9u8; 128]);
+        assert!(!store.0.contains_key(&(3, 4, 0)));
+        assert_eq!(store.1, super::COMPUTE_BLOBS_MAX, "a blob that is not kept is not charged");
+        // … but the caller gets it for the disk
+        assert_eq!(over.expect("the blob for the disk cache").as_slice(), &[9u8; 128][..]);
+
+        assert!(super::remember_compute_blob(&mut store, (5, 6, 0), Vec::new()).is_none(), "an empty blob is nothing to keep");
+    }
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -4292,19 +4312,35 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
 }
 
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
-/// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || compute_blob(key).is_some() {
-        return;
+/// passes owned by `TwoPassPso`), for the disk cache; kept in memory too while `COMPUTE_BLOBS_MAX`
+/// has room.
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+        return None;
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
+    if let Some(b) = compute_blob(key) {
+        return Some(b);
+    }
+    let bytes = read_pso_cached_blob(pso)?;
     let mut g = COMPUTE_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
-        return;
+    remember_compute_blob(g.get_or_insert_with(|| (HashMap::new(), 0)), key, bytes)
+}
+
+/// `bytes`, the driver's blob of the pipeline `key`, for its caller – and in `store` (the blobs
+/// kept in memory and their bytes in all) while `COMPUTE_BLOBS_MAX` has room. The blob is
+/// returned either way: it used to reach the disk cache only when the store had taken it, so
+/// once the store was full no later build was kept on disk, and a retail title's slowest
+/// pipelines (20 to 150 s each in the driver) were built again in every run.
+fn remember_compute_blob(store: &mut (HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize), key: (u64, usize, i32), bytes: Vec<u8>) -> Option<std::sync::Arc<Vec<u8>>> {
+    if bytes.is_empty() {
+        return None;
     }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    let bytes = std::sync::Arc::new(bytes);
+    if store.1 + bytes.len() <= COMPUTE_BLOBS_MAX {
+        store.1 += bytes.len();
+        store.0.insert(key, bytes.clone());
+    }
+    Some(bytes)
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
@@ -5421,8 +5457,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
+        if let (Some(p), Some(b)) = (cdisk.as_deref(), keep_compute_blob(ckey, compute, tp.cs.len())) {
             driver_cache::keep(p, &b, cin_driver);
         }
     } else if creused && cfrom_disk {
