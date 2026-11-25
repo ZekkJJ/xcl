@@ -63,7 +63,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let video = crate::hle::d3d12x::real::video_memory();
+                let [(local, local_budget), (non_local, non_local_budget)] = video.unwrap_or_default();
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
@@ -87,6 +88,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         "PSO memory: {} live shaders, {} unique bytes, {} referenced bytes, {} estimated interner metadata bytes, {} pending / {} built / {} failed pipelines",
                         shaders, unique, referenced, metadata, pending, built, failed,
                     );
+                }
+                if video.is_some() {
+                    crate::xlog_info!("DXGI memory budgets: {} MiB local, {} MiB non-local", mb(local_budget), mb(non_local_budget));
+                    let (slots, heaps) = crate::hle::d3d12x::vram::small_texture_backing_bytes();
+                    crate::xlog_info!("small texture backing: {slots} bytes in assigned slots, {heaps} bytes in heaps");
                 }
                 last = now;
             }

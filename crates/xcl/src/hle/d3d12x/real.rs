@@ -198,6 +198,29 @@ pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
 }
 
+fn locate_gpu_window(va: u64, ranges: impl IntoIterator<Item = (u64, u64)>) -> Option<(usize, u64)> {
+    ranges.into_iter().enumerate().find_map(|(index, (base, size))| {
+        if base == 0 {
+            return None;
+        }
+        let offset = va.checked_sub(base)?;
+        (offset < size).then_some((index, offset))
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn dred_gpu_window_excludes_null_slots_and_unbacked_tails() {
+    let windows = [(0, 1 << 32), (0x1000, 0), (0x4000, 0x0800), (0x5000, 0x1000)];
+    assert_eq!(locate_gpu_window(0, windows), None);
+    assert_eq!(locate_gpu_window(0x1000, windows), None);
+    assert_eq!(locate_gpu_window(0x4000, windows), Some((2, 0)));
+    assert_eq!(locate_gpu_window(0x47ff, windows), Some((2, 0x07ff)));
+    assert_eq!(locate_gpu_window(0x4800, windows), None);
+    assert_eq!(locate_gpu_window(0x524a, windows), Some((3, 0x024a)));
+    assert_eq!(locate_gpu_window(u64::MAX, windows), None);
+}
+
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
 pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     let u = crate::gpu::uma::get()?;
@@ -480,8 +503,8 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
-/// The process's video memory on the device's adapter: (local, non-local) bytes in use.
-pub fn video_memory() -> Option<(u64, u64)> {
+/// The process's current usage and budget in bytes, for local and then non-local video memory.
+pub fn video_memory() -> Option<[(u64, u64); 2]> {
     use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
@@ -493,7 +516,7 @@ pub fn video_memory() -> Option<(u64, u64)> {
         let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage))
+        Some([(local.CurrentUsage, local.Budget), (non_local.CurrentUsage, non_local.Budget)])
     }
 }
 
@@ -1664,6 +1687,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     // (Two last-but-one releases at once can miss each other here; the object then goes at
     // once, as before.)
     let mut held = false;
+    let mut small_slot_held = false;
     let n = if super::late_release::enabled() {
         let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
         if add(this) == 2 {
@@ -1694,7 +1718,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             m.remove(&(this as usize));
         }
         super::sparse::forget_buffer(this as usize);
-        super::vram::forget(this as usize);
+        small_slot_held = super::vram::forget(this as usize, held);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
@@ -1706,7 +1730,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
     }
     if held {
-        super::late_release::hold(this as usize);
+        super::late_release::hold(this as usize, small_slot_held);
     }
     n
 }
@@ -6675,7 +6699,16 @@ pub fn log_device_removed() {
                 v.join(", ")
             };
             let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+            let windows = uma_window_vas();
+            let position = if va == 0 || windows.is_empty() {
+                None
+            } else {
+                crate::gpu::uma::get().and_then(|uma| {
+                    let ranges = windows.iter().enumerate().map(|(k, &base)| (base, uma.window(k).1 as u64));
+                    locate_gpu_window(va, ranges)
+                })
+            };
+            let window = position.map(|(k, offset)| format!(" = window {k} + {offset:#x}")).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
