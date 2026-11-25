@@ -1150,9 +1150,83 @@ static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// producer queue that stands behind one of them shows in the log.
 struct InternalWait {
     what: &'static str,
+    /// the cell's address for a bridged `Wait64BitValueX` (0: not one)
+    va: u64,
     fence: ID3D12Fence,
     value: u64,
     at: Instant,
+}
+
+/// queue → its private progress fence, the submits signalled on it, and when each of the
+/// last ones was signalled (diagnostic: how far behind a queue is, and since when)
+struct Progress {
+    fence: ID3D12Fence,
+    submitted: u64,
+    recent: std::collections::VecDeque<(u64, Instant)>,
+}
+
+unsafe impl Send for Progress {}
+
+static PROGRESS: Mutex<Option<HashMap<usize, Progress>>> = Mutex::new(None);
+
+/// After a submit to `queue`: a Signal of its private progress fence.
+pub(super) unsafe fn note_submitted(queue: *mut c_void) {
+    if queue.is_null() {
+        return;
+    }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let mut g = PROGRESS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if !m.contains_key(&(queue as usize)) {
+        let mut dev: Option<ID3D12Device> = None;
+        if q.GetDevice(&mut dev).is_err() {
+            return;
+        }
+        let Some(dev) = dev else { return };
+        let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+        m.insert(queue as usize, Progress { fence, submitted: 0, recent: Default::default() });
+    }
+    let p = m.get_mut(&(queue as usize)).unwrap();
+    p.submitted += 1;
+    if q.Signal(&p.fence, p.submitted).is_ok() {
+        p.recent.push_back((p.submitted, Instant::now()));
+        while p.recent.len() > 4096 {
+            p.recent.pop_front();
+        }
+    }
+}
+
+/// `q<id> <done>/<submitted> submits (oldest unfinished for <ms> ms)` for every queue behind.
+fn progress_summary() -> String {
+    let rows: Vec<(usize, String)> = {
+        let mut g = PROGRESS.lock().unwrap();
+        g.iter_mut()
+            .flat_map(|m| m.iter_mut())
+            .filter_map(|(&q, p)| {
+                let done = unsafe { super::real::fence_completed(&p.fence) };
+                while p.recent.front().is_some_and(|&(n, _)| n <= done) {
+                    p.recent.pop_front();
+                }
+                (done < p.submitted).then(|| (q, format!("{done}/{} submits (oldest unfinished for {} ms)", p.submitted, p.recent.front().map_or(0, |&(_, t)| t.elapsed().as_millis()))))
+            })
+            .collect()
+    };
+    if rows.is_empty() {
+        return "no queue is behind".into();
+    }
+    let mut rows: Vec<String> = rows.into_iter().map(|(q, s)| format!("q{} {s}", queue_id(q))).collect();
+    rows.sort();
+    rows.join(", ")
+}
+
+/// `queue` was made to wait for the fence of the cell at `va` to reach `value` (a bridged
+/// `Wait64BitValueX`): listed with XCL's own waits while it is unmet, whatever the sync graph
+/// has done with it since.
+fn note_cell_wait(queue: usize, va: u64, fence: &ID3D12Fence, value: u64) {
+    let mut g = INTERNAL_WAITS.lock().unwrap();
+    let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
+    waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
+    waits.push(InternalWait { what: "Wait64 cell", va, fence: fence.clone(), value, at: Instant::now() });
 }
 
 static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex::new(None);
@@ -1162,7 +1236,7 @@ pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D1
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
     waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
-    waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
+    waits.push(InternalWait { what, va: 0, fence: fence.clone(), value, at: Instant::now() });
 }
 
 /// The internal waits not yet met: `q<id>: <what> >= <value> (done <completed>, <age> ms)`.
@@ -1174,7 +1248,8 @@ fn internal_waits_summary() -> String {
             .flat_map(|(&q, waits)| waits.iter().map(move |w| (q, w)))
             .filter_map(|(q, w)| {
                 let done = unsafe { super::real::fence_completed(&w.fence) };
-                (done < w.value).then(|| (q, format!("{} >= {:#x} (done {done:#x}, {} ms)", w.what, w.value, w.at.elapsed().as_millis())))
+                let what = if w.va != 0 { format!("{} {:#x}", w.what, w.va) } else { w.what.to_string() };
+                (done < w.value).then(|| (q, format!("{what} >= {:#x} (done {done:#x}, {} ms)", w.value, w.at.elapsed().as_millis())))
             })
             .collect()
     };
@@ -1545,6 +1620,7 @@ fn wake_sync_watchdog() {
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
                 crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
+                crate::xlog_warn!("D3D12.X: queues behind during GPU wait timeout: {}", progress_summary());
             }
         });
     });
@@ -1921,6 +1997,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::FallbackCpu;
     }
 
+    note_cell_wait(q_raw, w.va, &fence, w.value);
     wake_sync_watchdog();
     if unsubmitted {
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -3097,6 +3174,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
                 cpu_writes_after(q_raw, chunk);
+                note_submitted(q_raw);
             });
             super::title_textures::submitted(prior);
             for &p in prior {
