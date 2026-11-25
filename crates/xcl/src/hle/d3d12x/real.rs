@@ -4902,9 +4902,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 /// The root signature pointer is kept as is (the translated paths replace it).
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<[u8]>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<[u8]>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<std::sync::Arc<[u8]>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<SharedShader>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<SharedShader>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<SharedShader>),
 }
 
 unsafe impl Send for OwnedDesc {}
@@ -4912,9 +4912,13 @@ unsafe impl Send for OwnedDesc {}
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
 pub(crate) fn shaders_key<B: AsRef<[u8]>>(blobs: &[B]) -> u64 {
+    shaders_key_from_hashes(blobs.iter().map(|b| crate::gpu::shader::fnv64(b.as_ref())))
+}
+
+fn shaders_key_from_hashes(hashes: impl Iterator<Item = u64>) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
+    for shader in hashes {
+        h = (h ^ shader).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }
@@ -4939,21 +4943,43 @@ mod shaders_key_tests {
         assert!(std::sync::Arc::ptr_eq(&a, &b));
         let c = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5b]);
         assert!(!std::sync::Arc::ptr_eq(&a, &c));
-        assert_eq!(&*c, &[7u8, 1, 2, 3, 0x5b]);
-        assert_eq!(super::shaders_key(&[a.clone()]), super::shaders_key(&[vec![7u8, 1, 2, 3, 0x5a]]));
+        assert_eq!(&*c.bytes, &[7u8, 1, 2, 3, 0x5b]);
+        assert_eq!(super::shaders_key_from_hashes([a.hash].into_iter()), super::shaders_key(&[vec![7u8, 1, 2, 3, 0x5a]]));
         drop((a, b));
         let d = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
-        assert_eq!(&*d, &[7u8, 1, 2, 3, 0x5a], "a copy every pipeline released is made again");
+        assert_eq!(&*d.bytes, &[7u8, 1, 2, 3, 0x5a], "a copy every pipeline released is made again");
+    }
+
+    #[test]
+    fn colliding_shaders_keep_their_bytes_and_release_their_entries() {
+        use std::sync::Arc;
+        let hash = 0x827_2024_0000;
+        let a = super::intern_shader_with_hash(hash, b"same length a");
+        let b = super::intern_shader_with_hash(hash, b"same length b");
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(&*a.bytes, b"same length a");
+        assert_eq!(&*b.bytes, b"same length b");
+        let weak = Arc::downgrade(&a);
+        std::thread::scope(|scope| {
+            let find = scope.spawn(|| super::intern_shader_with_hash(hash, b"same length a"));
+            assert!(Arc::ptr_eq(&a, &find.join().unwrap()));
+        });
+        drop(a);
+        assert!(weak.upgrade().is_none());
+        assert!(Arc::ptr_eq(&b, &super::intern_shader_with_hash(hash, b"same length b")));
+        let key = (hash, b.bytes.len());
+        drop(b);
+        let table = super::SHADER_BLOBS.lock().unwrap();
+        assert!(!table.as_ref().is_some_and(|t| t.contains_key(&key)));
     }
 }
 
 impl OwnedDesc {
     fn shaders_key(&self) -> u64 {
-        shaders_key(match self {
-            OwnedDesc::Compute(_, b) => b,
-            OwnedDesc::Graphics(_, b, ..) => b,
-            OwnedDesc::Stream(_, _, b) => b,
-        })
+        let blobs = match self {
+            Self::Compute(_, b) | Self::Graphics(_, b, ..) | Self::Stream(_, _, b) => b,
+        };
+        shaders_key_from_hashes(blobs.iter().map(|blob| blob.hash))
     }
 
     fn ptr(&self) -> *const c_void {
@@ -4965,29 +4991,88 @@ impl OwnedDesc {
     }
 }
 
-/// Intern a shader blob into a weak cache keyed by hash and length (verified byte-for-byte) so
-/// pending async pipelines that reuse the same bytecode share one `Arc<[u8]>`.
-fn intern_shader_blob(bytes: &[u8]) -> std::sync::Arc<[u8]> {
-    static BLOBS: Mutex<Option<HashMap<(u64, usize), std::sync::Weak<[u8]>>>> = Mutex::new(None);
-    let key = (crate::gpu::shader::fnv64(bytes), bytes.len());
-    let mut g = BLOBS.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
-    if let Some(arc) = m.get(&key).and_then(|w| w.upgrade()) {
-        if &*arc == bytes {
-            return arc;
+type SharedShader = std::sync::Arc<ShaderBlob>;
+type WeakShader = std::sync::Weak<ShaderBlob>;
+type ShaderBlobTable = HashMap<(u64, usize), Vec<WeakShader>>;
+static SHADER_BLOBS: Mutex<Option<ShaderBlobTable>> = Mutex::new(None);
+
+struct ShaderBlob {
+    hash: u64,
+    // The last strong owner releases the payload even if a weak reference survives.
+    bytes: Box<[u8]>,
+}
+
+impl Drop for ShaderBlob {
+    fn drop(&mut self) {
+        let mut guard = SHADER_BLOBS.lock().unwrap();
+        let Some(table) = guard.as_mut() else { return };
+        let key = (self.hash, self.bytes.len());
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = table.entry(key) {
+            // An intern may already have added a replacement while this destructor waited.
+            entry.get_mut().retain(|blob| !std::ptr::eq(blob.as_ptr(), self));
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        if table.is_empty() {
+            *guard = None;
+        } else if table.capacity() > table.len().saturating_mul(4).max(256) {
+            table.shrink_to(table.len().saturating_mul(2));
         }
     }
-    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
-    m.insert(key, std::sync::Arc::downgrade(&arc));
-    arc
+}
+
+fn intern_shader_blob(bytes: &[u8]) -> SharedShader {
+    intern_shader_with_hash(crate::gpu::shader::fnv64(bytes), bytes)
+}
+
+fn intern_shader_with_hash(hash: u64, bytes: &[u8]) -> SharedShader {
+    // Nonmatching upgraded owners must be dropped after the table lock. A final owner
+    // needs the same lock to remove its entry. The ordinary hit needs no temporary allocation.
+    let mut collisions = Vec::new();
+    let mut guard = SHADER_BLOBS.lock().unwrap();
+    let bucket = guard.get_or_insert_with(HashMap::new).entry((hash, bytes.len())).or_insert_with(|| Vec::with_capacity(1));
+    for blob in bucket.iter().filter_map(WeakShader::upgrade) {
+        if &*blob.bytes == bytes {
+            return blob;
+        }
+        collisions.push(blob);
+    }
+    let blob = std::sync::Arc::new(ShaderBlob { hash, bytes: bytes.into() });
+    bucket.push(std::sync::Arc::downgrade(&blob));
+    blob
+}
+
+/// Current bytecode ownership for the activity log. Metadata counts the usable hash-table
+/// slots, weak-reference vector capacities and Arc headers, excluding allocator overhead.
+pub fn pending_shader_memory() -> (usize, usize, usize, usize) {
+    let guard = SHADER_BLOBS.lock().unwrap();
+    let Some(table) = guard.as_ref() else { return (0, 0, 0, 0) };
+    let mut unique = 0;
+    let mut referenced = 0;
+    let mut live = 0;
+    let mut metadata = table.capacity() * std::mem::size_of::<((u64, usize), Vec<WeakShader>)>();
+    for (&(_, size), bucket) in table {
+        let arc = std::mem::size_of::<ShaderBlob>() + 2 * std::mem::size_of::<usize>();
+        metadata += bucket.capacity() * std::mem::size_of::<WeakShader>() + bucket.len() * arc;
+        for weak in bucket {
+            let refs = weak.strong_count();
+            if refs != 0 {
+                live += 1;
+                unique += size;
+                referenced += size * refs;
+            }
+        }
+    }
+    (live, unique, referenced, metadata)
 }
 
 /// Share or copy a shader blob into `blobs` and point `b` at it.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<std::sync::Arc<[u8]>>) {
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<SharedShader>) {
     if let Some(bytes) = shader_bytes(b) {
         blobs.push(intern_shader_blob(bytes));
         let v = blobs.last().unwrap();
-        *b = bytecode(v);
+        *b = bytecode(&v.bytes);
     } else {
         *b = D3D12_SHADER_BYTECODE::default();
     }
@@ -5034,7 +5119,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<std::sync::Arc<[u8]>> = Vec::new();
+    let mut blobs: Vec<SharedShader> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -5047,7 +5132,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                 if p != 0 && n != 0 && crate::gpu::shader::readable(p, n) {
                     let slice = std::slice::from_raw_parts(p as *const u8, n);
                     blobs.push(intern_shader_blob(slice));
-                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
+                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().bytes.as_ptr() as u64).to_le_bytes());
                 }
             }
             7 | 12 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,

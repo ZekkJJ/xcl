@@ -38,6 +38,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
+            let pso_memory = std::env::var_os("XCL_PSO_MEMORY").is_some();
             let snap = || {
                 let (p, e) = crate::hle::d3d12x::present::activity();
                 let (d, x) = crate::hle::d3d12x::bind::activity();
@@ -79,6 +80,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                if pso_memory {
+                    let (shaders, unique, referenced, metadata) = crate::hle::d3d12x::real::pending_shader_memory();
+                    let (built, failed, pending) = crate::hle::d3d12x::pso_async::counts();
+                    crate::xlog_info!(
+                        "PSO memory: {} live shaders, {} unique bytes, {} referenced bytes, {} estimated interner metadata bytes, {} pending / {} built / {} failed pipelines",
+                        shaders, unique, referenced, metadata, pending, built, failed,
+                    );
+                }
                 last = now;
             }
         });

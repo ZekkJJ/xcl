@@ -392,6 +392,19 @@ fn preload() -> Option<&'static Preload> {
 mod used_tests {
     use super::*;
 
+    #[test]
+    fn release_drops_an_unclaimed_job_even_while_the_queue_owns_pending() {
+        let standin = 0x7E57_B827usize;
+        let bytes = Arc::new(vec![0x5a; 4096]);
+        let weak = Arc::downgrade(&bytes);
+        submit_lazy(standin, true, Box::new(move || bytes.len()), 0);
+        let queued = entry(standin).unwrap();
+        assert_eq!(released(standin), 0);
+        assert!(weak.upgrade().is_none(), "the queued descriptor was cancelled");
+        assert!(queued.job.lock().unwrap().is_none());
+        assert!(*queued.done.lock().unwrap(), "a concurrent binder can finish waiting");
+    }
+
     /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
     /// `kernelx::Sleep` does not count that time.
     #[test]
@@ -620,14 +633,21 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
-    let done = p.done.lock().unwrap();
+    let mut done = p.done.lock().unwrap();
     if *done {
-        p.real.swap(0, Ordering::AcqRel)
-    } else {
-        // the worker stores its result into a Pending nobody will read: mark it orphaned
-        p.orphan.store(true, Ordering::Release);
-        0
+        return p.real.swap(0, Ordering::AcqRel);
     }
+    p.orphan.store(true, Ordering::Release);
+    // A queue can still own Pending. Take an unclaimed job here to release its descriptor
+    // immediately. A worker that already took it owns the descriptor until it finishes.
+    let cancelled = p.job.lock().unwrap().take();
+    if cancelled.is_some() {
+        *done = true;
+        p.cv.notify_all();
+    }
+    drop(done);
+    drop(cancelled);
+    0
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.
