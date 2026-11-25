@@ -786,6 +786,13 @@ impl Request {
     }
 }
 
+/// Whether the page array overlaps the enqueuing thread's stack.
+fn on_callers_stack(ptr: usize, bytes: usize) -> bool {
+    let (mut low, mut high) = (0usize, 0usize);
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high) };
+    ptr < high && ptr.saturating_add(bytes.max(1)) > low
+}
+
 /// Snapshot a `PULONG_PTR` physical page array at enqueue time (callers often stack-allocate it).
 unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Vec<usize>, HRESULT> {
     if byte_len == 0 {
@@ -879,7 +886,7 @@ fn note_request(r: &Request) {
 }
 
 /// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
@@ -940,10 +947,11 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // lists in slots of its own table and writes a slot's pages after EnqueueRequest, so at
         // enqueue a slot can still name the pages of its previous request: written there, the
         // data lands in memory the title has since used for something else, or in freed pages.
-        // The list as it is now is taken when all its pages are allocated; otherwise (an array
-        // on the stack, overwritten since) the snapshot.
+        // A list on the caller's stack keeps its snapshot, because stack slots may now name
+        // unrelated live pages.
         let mut current = vec![0usize; pages.len()];
-        let pages = if read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
+        let pages = if !dest_on_stack
+            && read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
             && current[..] != pages[..]
             && crate::hle::kernelx::physical_pages_live(&current)
         {
@@ -959,8 +967,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack). The title keeps an array with such an entry
+        // with page 0. The title keeps an array with such an entry
         // until the request is done: one it has freed or reused meanwhile cannot be told from
         // a late fill. Read like the snapshot (`read_own`): an array unmapped since then fails
         // the request instead of faulting in this worker (#476).
@@ -1018,6 +1025,7 @@ enum Entry {
         req: Request,
         file: Option<Arc<FileInner>>,
         dest_pages: Option<Vec<usize>>,
+        dest_on_stack: bool,
         src_pages: Option<Vec<usize>>,
     },
     /// refused at enqueue: reported in queue order by the worker (unless cancelled, as a request)
@@ -1172,12 +1180,12 @@ impl QueueInner {
             return;
         }
         match e {
-            Entry::Request { seq, req, file, dest_pages, src_pages } => {
+            Entry::Request { seq, req, file, dest_pages, dest_on_stack, src_pages } => {
                 if self.is_cancelled(seq, req.tag) {
                     // Cancelled requests are skipped without affecting status or error record.
                     return;
                 }
-                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), dest_on_stack, src_pages.as_deref()) } {
                     self.update_error(hr, req, file.as_deref(), since_status);
                 }
             }
@@ -1238,8 +1246,8 @@ impl QueueInner {
         }
     }
 
-    fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
-        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, src_pages });
+    fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, dest_on_stack: bool, src_pages: Option<Vec<usize>>) {
+        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, dest_on_stack, src_pages });
     }
 
     /// A request refused at enqueue, numbered as a request so `CancelRequestsWithTag` covers it.
@@ -1429,7 +1437,10 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     } else {
         None
     };
-    q.enqueue_request(r, file, dest_pages, src_pages);
+    let dest_on_stack = dest_pages.as_deref().is_some_and(|pages| {
+        on_callers_stack(r.destination as usize, std::mem::size_of_val(pages))
+    });
+    q.enqueue_request(r, file, dest_pages, dest_on_stack, src_pages);
 }
 
 unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_void, index: u32) {
@@ -2480,7 +2491,8 @@ mod tests {
 
     /// A title's table slot still names its previous request's page at enqueue and gets this
     /// request's page before Submit: the data goes to the page named at execution, and the old
-    /// page (in use for something else by then) is left alone.
+    /// page (in use for something else by then) is left alone. A list on the enqueuing thread's
+    /// stack keeps its snapshot: a page written there since, though allocated, is not taken.
     #[test]
     fn a_destination_page_rewritten_after_enqueue() {
         use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
@@ -2504,7 +2516,7 @@ mod tests {
             let mut q = std::ptr::null_mut();
             assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
             let mut s = std::ptr::null_mut();
-            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
             let qv = *(q as *const *const usize);
             let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
             let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
@@ -2538,6 +2550,24 @@ mod tests {
             let new_page = std::slice::from_raw_parts((reserved as *const u8).add(PHYS_PAGE_SIZE), data.len());
             assert_eq!(new_page, &data[..], "the data goes to the page the slot names at execution");
             assert!(old_page.iter().all(|&b| b == 0xAB), "the slot's previous page is left alone");
+
+            // the same on the enqueuing thread's stack: rewritten after enqueue with another live
+            // page, the list keeps its snapshot
+            let other = std::slice::from_raw_parts_mut((reserved as *mut u8).add(PHYS_PAGE_SIZE), data.len());
+            other.fill(0xCD);
+            let data2: Vec<u8> = (0..0x100u32).map(|i| (i * 3 + 5) as u8).collect();
+            let mut on_stack = [pages[0]];
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, on_stack.as_ptr() as u64, 0, data2.len() as u32, data2.as_ptr() as u64, 0, data2.len() as u32, 0, 0).as_ptr());
+            std::ptr::write_volatile(&mut on_stack[0], pages[1]);
+            status(q, s, 1);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 1) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 1), S_OK);
+            assert_eq!(&old_page[..], &data2[..], "a list on the stack: the page of its snapshot");
+            assert!(other.iter().all(|&b| b == 0xCD), "the page written on the stack since is left alone");
 
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
