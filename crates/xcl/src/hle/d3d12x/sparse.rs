@@ -910,11 +910,23 @@ impl State {
         if target == 0 || super::real::fence_completed(&self.fence) >= target {
             return;
         }
-        let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if super::real::fence_completed(&self.fence) < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", super::real::fence_completed(&self.fence));
+        // The event is one for all waits here, and a wait that gave up leaves its registration
+        // behind: that one sets the event later, and the next wait would return at once with the
+        // queue not there (10 such "after 5 s" lines within 100 ms in one run, each followed by a
+        // Reset of an allocator the GPU was still in). So: until the fence says so, or 5 s.
+        let t0 = std::time::Instant::now();
+        loop {
+            let _ = self.fence.SetEventOnCompletion(target, self.event);
+            let left = 5000u64.saturating_sub(t0.elapsed().as_millis() as u64).max(1) as u32;
+            windows::Win32::System::Threading::WaitForSingleObject(self.event, left);
+            if super::real::fence_completed(&self.fence) >= target {
+                return;
+            }
+            if t0.elapsed().as_millis() >= 5000 {
+                break;
+            }
         }
+        crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", super::real::fence_completed(&self.fence));
     }
 
     #[inline]
@@ -1156,15 +1168,18 @@ impl State {
                     continue;
                 }
                 // the title's lists are done: only the copy itself is left
-                // (briefly: the state's lock is held here, and every submit needs it; a copy that
-                // stands behind something else on its queue lands when it is done)
-                let _ = done_f.SetEventOnCompletion(done_v, self.event);
-                windows::Win32::System::Threading::WaitForSingleObject(self.event, 20);
+                // (for 2 ms at most: the state's lock is held here, and every submit needs it; a copy
+                // that stands behind something else on its queue lands when it is done)
+                // (no event: `self.event` is the tile queue's, see `wait_for`)
+                let t0 = std::time::Instant::now();
+                while super::real::fence_completed(&done_f) < done_v && t0.elapsed().as_micros() < 2000 {
+                    std::thread::yield_now();
+                }
                 if super::real::fence_completed(&done_f) < done_v {
                     static LATE: AtomicU64 = AtomicU64::new(0);
                     let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
                     if k.is_power_of_two() {
-                        crate::xlog_warn!("sparse: {k} copies back so far not finished 20 ms after the title's work they follow – left for later");
+                        crate::xlog_warn!("sparse: {k} copies back so far not finished 2 ms after the title's work they follow – left for later");
                     }
                     i += 1;
                     continue;
