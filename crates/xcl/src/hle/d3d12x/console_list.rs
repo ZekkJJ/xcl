@@ -679,6 +679,7 @@ pub struct Translation {
 /// Turn the recorded console commands into commands on the PC list and close it.
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
+    super::title_textures::note_list_closed(obj);
     let mut guard = LISTS.lock().unwrap();
     let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("not an XCL console list")?;
     if let Some(last) = st.chunks.last_mut() {

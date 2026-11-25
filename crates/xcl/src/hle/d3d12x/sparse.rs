@@ -215,6 +215,19 @@ struct RbJob {
     /// the lists it follows are done, the second `done_v` when the copy is. None: `rb_fence` and
     /// the readback queue's fence (the form before)
     fences: Option<(ID3D12Fence, ID3D12Fence)>,
+    /// place among the submissions' jobs (`State::job_seq`): copies and immediates land in it
+    seq: u64,
+}
+
+/// Immediates the title's lists wrote into a window (`list_x::imm_by_cpu`): stored in the
+/// title's memory once `fence` reaches `value` (the lists are done on the GPU).
+struct ImmJob {
+    /// place among the copies back (`RbJob::seq`)
+    seq: u64,
+    fence: ID3D12Fence,
+    value: u64,
+    /// (address, value, bytes)
+    writes: Vec<(usize, u64, u8)>,
 }
 
 /// How far `drain_readbacks` goes
@@ -251,6 +264,10 @@ struct State {
     /// submitted copies back, oldest first, and finished ones to reuse
     rb_jobs: VecDeque<RbJob>,
     rb_pool: Vec<RbJob>,
+    /// immediates of the title's submissions, oldest first, and the count that orders them
+    /// with `rb_jobs`
+    imm_jobs: VecDeque<ImmJob>,
+    job_seq: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
@@ -571,6 +588,8 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         rbq_value: 0,
         rb_jobs: VecDeque::new(),
         rb_pool: Vec::new(),
+        imm_jobs: VecDeque::new(),
+        job_seq: 0,
         windows,
         pools: Vec::new(),
         free: Vec::new(),
@@ -1125,6 +1144,21 @@ impl State {
         self.sync_sent_range(dst, len);
     }
 
+    /// An immediate the GPU wrote at `va` (`bytes`: 4 or 8), into the title's memory there
+    unsafe fn store_imm(&mut self, va: usize, value: u64, bytes: u8) {
+        let pg = va & !(PAGE - 1);
+        let t = pg & !(TILE - 1);
+        if !self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((pg - t) / PAGE)) == 0) {
+            return;
+        }
+        match bytes {
+            4 => (*(va as *const std::sync::atomic::AtomicU32)).store(value as u32, Ordering::Release),
+            8 => (*(va as *const AtomicU64)).store(value, Ordering::Release),
+            _ => return,
+        }
+        self.sync_sent_range(va, bytes as usize);
+    }
+
     /// A copy back's list and a readback buffer of at least `need` bytes (reused when one fits)
     unsafe fn rb_job(&mut self, need: usize, ty: D3D12_COMMAND_LIST_TYPE) -> Option<RbJob> {
         if let Some(i) = self.rb_pool.iter().enumerate().filter(|(_, j)| j.cap >= need && j.ty == ty).min_by_key(|(_, j)| j.cap).map(|(i, _)| i) {
@@ -1144,7 +1178,7 @@ impl State {
         let buf = r?;
         let mut p: *mut c_void = std::ptr::null_mut();
         buf.Map(0, None, Some(&mut p)).ok()?;
-        Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new(), ty, fences: None })
+        Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new(), ty, fences: None, seq: 0 })
     }
 
     /// Land submitted copies back in the title's memory as far as `how` says: every job that is
@@ -1153,13 +1187,32 @@ impl State {
     unsafe fn drain_readbacks(&mut self, how: Drain) {
         let rbq_done = self.rbq.as_ref().map(|(_, f)| f.clone());
         let mut i = 0;
-        while i < self.rb_jobs.len() {
+        let mut k = 0;
+        loop {
+            // the immediates of submissions before the next copy back first
+            while k < self.imm_jobs.len() && self.rb_jobs.get(i).is_none_or(|j| self.imm_jobs[k].seq < j.seq) {
+                if super::real::fence_completed(&self.imm_jobs[k].fence) < self.imm_jobs[k].value {
+                    k += 1;
+                    continue;
+                }
+                let Some(job) = self.imm_jobs.remove(k) else { break };
+                for &(va, value, bytes) in &job.writes {
+                    self.store_imm(va, value, bytes);
+                }
+                RB_PENDING.fetch_sub(1, Ordering::Release);
+            }
+            if i >= self.rb_jobs.len() {
+                break;
+            }
             let (title_f, done_f, rb_v, done_v) = {
                 let j = &self.rb_jobs[i];
                 match (&j.fences, &rbq_done) {
                     (Some((a, b)), _) => (a.clone(), b.clone(), j.rb_v, j.done_v),
                     (None, Some(d)) => (self.rb_fence.clone(), d.clone(), j.rb_v, j.done_v),
-                    (None, None) => return,
+                    (None, None) => {
+                        i += 1;
+                        continue;
+                    }
                 }
             };
             if super::real::fence_completed(&done_f) < done_v {
@@ -1248,6 +1301,8 @@ impl State {
             job.rb_v = v;
             job.done_v = v;
             job.fences = Some(fences.clone());
+            self.job_seq += 1;
+            job.seq = self.job_seq;
             self.rb_jobs.push_back(job);
             RB_PENDING.fetch_add(1, Ordering::Release);
             RB_ASYNC.store(true, Ordering::Relaxed);
@@ -1468,13 +1523,13 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
 
-pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
-    if ranges.is_empty() {
+pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)], imms: &[(usize, u64, u8)]) {
+    if ranges.is_empty() && imms.is_empty() {
         return;
     }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
-    s.after_execute(queue, ranges);
+    s.after_execute(queue, ranges, imms);
 }
 
 /// The PC `ExecuteCommandLists` of `queue` for `list` (an adopted title queue's own method,
@@ -1539,7 +1594,7 @@ fn start_readback_thread() {
             std::thread::sleep(std::time::Duration::from_micros(500));
             if let Ok(mut g) = STATE.try_lock() {
                 forget_released(&mut g);
-                if let Some(s) = g.as_mut().filter(|s| !s.rb_jobs.is_empty()) {
+                if let Some(s) = g.as_mut().filter(|s| !s.rb_jobs.is_empty() || !s.imm_jobs.is_empty()) {
                     unsafe { s.drain_readbacks(Drain::Finished) };
                 }
             }
@@ -1549,10 +1604,24 @@ fn start_readback_thread() {
 
 impl State {
     /// `readback_after_execute` on this state
-    unsafe fn after_execute(&mut self, queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
+    unsafe fn after_execute(&mut self, queue: &ID3D12CommandQueue, ranges: &[(usize, usize)], imms: &[(usize, u64, u8)]) {
         let s = self;
         let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
-        if filtered.is_empty() {
+        // immediates: stored by XCL when the lists are done. One that another write of these
+        // lists overlaps, and all of them without a queue of the title's to order them on,
+        // come back with a copy like the rest.
+        let mut imm: Vec<(usize, u64, u8)> = Vec::new();
+        for &(a, v, n) in imms {
+            if s.window_index(a).is_none() {
+                continue;
+            }
+            if s.rbq.is_none() || ranges.iter().any(|&(ra, rn)| a < ra + rn && ra < a + n as usize) {
+                filtered.push((a, n as usize));
+            } else {
+                imm.push((a, v, n));
+            }
+        }
+        if filtered.is_empty() && imm.is_empty() {
             return;
         }
         filtered.sort_unstable();
@@ -1579,7 +1648,15 @@ impl State {
                 ((e.0.clone(), e.1.clone()), e.2)
             };
             let _ = queue.Signal(&fences.0, v);
-            s.readback_async(queue, &merged, &fences, v);
+            if !imm.is_empty() {
+                s.job_seq += 1;
+                s.imm_jobs.push_back(ImmJob { seq: s.job_seq, fence: fences.0.clone(), value: v, writes: imm });
+                RB_PENDING.fetch_add(1, Ordering::Release);
+                RB_ASYNC.store(true, Ordering::Relaxed);
+            }
+            if !merged.is_empty() {
+                s.readback_async(queue, &merged, &fences, v);
+            }
             start_readback_thread();
             return;
         }
@@ -2015,6 +2092,8 @@ mod tests {
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
                 rb_pool: Vec::new(),
+                imm_jobs: VecDeque::new(),
+                job_seq: 0,
                 windows: vec![(base, reserved.clone())],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2066,7 +2145,7 @@ mod tests {
             title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
 
             let t0 = std::time::Instant::now();
-            s.after_execute(&title, &[(base, 256)]);
+            s.after_execute(&title, &[(base, 256)], &[]);
             let took = t0.elapsed();
             assert!(took < std::time::Duration::from_secs(1), "the copy back waited {took:?} for the title's queue");
             s.drain_readbacks(Drain::Finished);
@@ -2202,6 +2281,8 @@ mod tests {
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
                 rb_pool: Vec::new(),
+                imm_jobs: VecDeque::new(),
+                job_seq: 0,
                 windows: Vec::new(),
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2413,6 +2494,8 @@ mod tests {
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
                 rb_pool: Vec::new(),
+                imm_jobs: VecDeque::new(),
+                job_seq: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2513,6 +2596,8 @@ mod tests {
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
                 rb_pool: Vec::new(),
+                imm_jobs: VecDeque::new(),
+                job_seq: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),

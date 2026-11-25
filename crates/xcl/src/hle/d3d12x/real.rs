@@ -6363,7 +6363,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         return;
     }
     // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
+    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);

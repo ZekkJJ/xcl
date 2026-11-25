@@ -660,7 +660,61 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
         return;
     }
     let _refresh = REFRESH.lock().unwrap();
-    own_work(|| refresh_once(queue));
+    own_work(|| refresh_once(queue, true));
+}
+
+/// microseconds since the first call, never 0
+fn now_us() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// when the last look for CPU writes began (`now_us`; 0: none yet)
+static LOOK_BEGAN: AtomicU64 = AtomicU64::new(0);
+/// title list -> when the title closed it (`now_us`)
+static CLOSED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+
+/// The title closed `list` (its own pointer): what the list's GPU work reads was written by now.
+pub(super) fn note_list_closed(list: usize) {
+    CLOSED.lock().unwrap().get_or_insert_with(Default::default).insert(list, now_us());
+}
+
+/// `XCL_LOOK_SKIP=1`: a submit all of whose lists were closed before the last look for CPU writes
+/// began goes without a look of its own (that look took what the lists read). Off unless set:
+/// a title may write what a closed list reads until it submits the list.
+fn look_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_LOOK_SKIP").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn closed_before_last_look(lists: &[*mut c_void]) -> bool {
+    let began = LOOK_BEGAN.load(Ordering::Acquire);
+    if began == 0 || lists.is_empty() {
+        return false;
+    }
+    let g = CLOSED.lock().unwrap();
+    let Some(m) = g.as_ref() else { return false };
+    lists.iter().all(|&l| m.get(&(l as usize)).is_some_and(|&t| t < began))
+}
+
+/// `refresh` before the title's ExecuteCommandLists of `lists` (its own pointers).
+pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
+    if BUSY.with(|b| b.get()) {
+        return;
+    }
+    let _refresh = REFRESH.lock().unwrap();
+    // with the lock: the look before this one is done, and its uploads are submitted
+    let old = closed_before_last_look(lists);
+    static N: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    let n = N[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let k = N[1].fetch_add(old as u64, Ordering::Relaxed) + old as u64;
+    if n % 1024 == 0 {
+        crate::xlog_info!(
+            "D3D12.X: {k} of {n} ExecuteCommandLists so far had all their lists closed before the last look for CPU writes began ({})",
+            if look_skip() { "their looks were left out" } else { "XCL_LOOK_SKIP=1 leaves their looks out" }
+        );
+    }
+    own_work(|| refresh_once(queue, !(old && look_skip())));
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -683,7 +737,7 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
-unsafe fn refresh_once(queue: *mut c_void) {
+unsafe fn refresh_once(queue: *mut c_void, look: bool) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -696,6 +750,10 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
+        if !look {
+            return 0;
+        }
+        LOOK_BEGAN.store(now_us(), Ordering::Release);
         WATCH_BUF.with(|wcell| {
             let mut buf = wcell.borrow_mut();
             if buf.len() < 16384 {
@@ -708,7 +766,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    if look {
+        super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    }
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)

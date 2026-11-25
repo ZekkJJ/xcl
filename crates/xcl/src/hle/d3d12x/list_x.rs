@@ -591,6 +591,10 @@ struct ListState {
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
+    /// Bottom-of-pipe immediates into a window the GPU has a copy of: (address, value, bytes).
+    /// XCL knows what the GPU writes there, so the CPU's view gets the value from XCL once the
+    /// submission is done on the GPU (`sparse::readback_after_execute`), without a copy back.
+    sparse_imm: Vec<(usize, u64, u8)>,
     /// Non-timestamp 64-bit `(va, value)` writes recorded by `Write64BitValue{Bottom,Top}OfPipeX`
     /// so `ExecuteCommandLists` / `KickoffX` can signal per-address GPU fences for cross-queue
     /// `Wait64BitValueX` without blocking the submitter thread on the CPU.
@@ -622,19 +626,38 @@ impl ListState {
             last.1 = last.1.max(end);
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
-            if self.sparse_writes.is_empty() {
+            if !self.has_sparse() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
             self.sparse_writes.push((va as usize, size as usize));
         }
     }
 
-    fn clear_sparse_writes(&mut self) -> Vec<(usize, usize)> {
-        if self.sparse_writes.is_empty() {
-            return Vec::new();
+    fn has_sparse(&self) -> bool {
+        !self.sparse_writes.is_empty() || !self.sparse_imm.is_empty()
+    }
+
+    /// `note_write` for an immediate of `bytes` (4 or 8) into a window the GPU has a copy of
+    fn note_imm(&mut self, va: u64, value: u64, bytes: u8) {
+        let end = va.saturating_add(bytes as u64);
+        if self.written_ranges.len() < MAX_WRITTEN_RANGES {
+            self.written_ranges.push((va, end));
+        } else if let Some(last) = self.written_ranges.last_mut() {
+            last.0 = last.0.min(va);
+            last.1 = last.1.max(end);
+        }
+        if !self.has_sparse() {
+            SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
+        }
+        self.sparse_imm.push((va as usize, value, bytes));
+    }
+
+    fn clear_sparse_writes(&mut self) -> (Vec<(usize, usize)>, Vec<(usize, u64, u8)>) {
+        if !self.has_sparse() {
+            return (Vec::new(), Vec::new());
         }
         SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
-        std::mem::take(&mut self.sparse_writes)
+        (std::mem::take(&mut self.sparse_writes), std::mem::take(&mut self.sparse_imm))
     }
 
     fn push_write64_signal(&mut self, va: u64, value: u64) {
@@ -765,7 +788,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
             if !old.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
-            if !old.sparse_writes.is_empty() {
+            if old.has_sparse() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
             if !old.write64_signals.is_empty() {
@@ -801,7 +824,7 @@ pub(super) fn on_release(list: usize) {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
-        if !old.sparse_writes.is_empty() {
+        if old.has_sparse() {
             SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
         if !old.write64_signals.is_empty() {
@@ -1861,6 +1884,8 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                 let completed = prune_completed_waits(cell);
                 if completed >= w.value {
                     // Fence already reached `w.value`: trust it if CPU memory agrees (not reset).
+                    drop(g);
+                    super::sparse::settle_readbacks();
                     return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
                 }
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
@@ -1931,8 +1956,9 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
         if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
-                g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
+                g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0), c.submitted_queue.map(queue_id)))
             };
+            let behind = progress_summary();
             crate::xlog_warn!(
                 "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?}; queue_type={}, after_write64={}, sync={cell_diag:x?})",
                 w.width * 8,
@@ -1945,6 +1971,9 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
                 q_ty,
                 w.after_write64
             );
+            if !behind.is_empty() {
+                crate::xlog_warn!("D3D12.X: queues behind at that time-out: {behind}");
+            }
             if once(&RING_DUMPED, 2) {
                 let (total, entries) = WRITE_TRACE.lock().unwrap().snapshot();
                 let summary: Vec<String> = entries
@@ -1965,22 +1994,23 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     if SPARSE_WRITE_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
         return;
     }
-    let ranges: Vec<(usize, usize)> = {
+    let (ranges, imms): (Vec<(usize, usize)>, Vec<(usize, u64, u8)>) = {
         let g = LISTS.lock().unwrap();
         let Some(m) = g.as_ref() else { return };
-        let mut out = Vec::new();
+        let (mut out, mut imm) = (Vec::new(), Vec::new());
         for &l in lists {
             if let Some(s) = m.get(&(l as usize)) {
                 out.extend_from_slice(&s.sparse_writes);
+                imm.extend_from_slice(&s.sparse_imm);
             }
         }
-        out
+        (out, imm)
     };
-    if ranges.is_empty() {
+    if ranges.is_empty() && imms.is_empty() {
         return;
     }
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        super::sparse::readback_after_execute(q, &ranges);
+        super::sparse::readback_after_execute(q, &ranges, &imms);
     }
 }
 
@@ -2341,6 +2371,16 @@ pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size:
     }
 }
 
+/// `XCL_IMM_BY_CPU=0`: a bottom-of-pipe immediate into a window the GPU has a copy of comes
+/// back to the CPU's view with a copy, like the lists' other memory writes. Otherwise XCL stores
+/// the value it was given there once the submission is done on the GPU. A retail title's CPU
+/// waits on such cells; copied back, one of them held a value up to 46 frames old in the CPU's
+/// view (and older than it had held before) while its GPU fence was reached.
+fn imm_by_cpu() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_IMM_BY_CPU").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Values written by the GPU at `va` (WriteBufferImmediate: MARKER_IN = when the command is
 /// reached, MARKER_OUT = when the work before it is done).
 unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
@@ -2359,7 +2399,13 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
-    note_write(list as usize, va, n);
+    // into a window the GPU only has a copy of: the CPU's view gets the value from XCL
+    if words.len() <= 2 && imm_by_cpu() && crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
+        let value = words.iter().enumerate().fold(0u64, |v, (i, &w)| v | (w as u64) << (32 * i));
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, n as u8);
+    } else {
+        note_write(list as usize, va, n);
+    }
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -2596,7 +2642,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             if !o.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
-            if !o.sparse_writes.is_empty() {
+            if o.has_sparse() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
             if !o.write64_signals.is_empty() {
@@ -3067,9 +3113,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
-    if !sparse_writes.is_empty() {
+    if !sparse_writes.0.is_empty() || !sparse_writes.1.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
-            super::sparse::readback_after_execute(q, &sparse_writes);
+            super::sparse::readback_after_execute(q, &sparse_writes.0, &sparse_writes.1);
         }
     }
     super::cpu_writes::after(q_raw, cpu_writes);
