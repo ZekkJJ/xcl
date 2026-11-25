@@ -1219,6 +1219,44 @@ fn progress_summary() -> String {
     rows.join(", ")
 }
 
+/// Diagnostic: the wait-for edges of the sync graph, one per GPU wait not yet met: who waits
+/// for which value of which cell (or title fence), and which submitted signal (queue, its
+/// place among that queue's calls) will meet it. A wait for a value no signal has been submitted
+/// for says what was recorded instead.
+fn edges_summary() -> String {
+    let mut rows: Vec<String> = Vec::new();
+    let g = SYNC_GRAPH.lock().unwrap();
+    let Some(graph) = g.as_ref() else { return "none".into() };
+    for (&va, cell) in &graph.cells {
+        let done = cell.fence.as_ref().map_or(0, |f| unsafe { super::real::fence_completed(f) });
+        for aw in &cell.armed_waits {
+            if aw.val <= done {
+                continue;
+            }
+            let met = cell.submitted_signals.iter().find(|s| s.val >= aw.val);
+            let by = match met {
+                Some(s) => format!("q{}@{} (signal {:#x})", queue_id(s.queue), s.seq, s.val),
+                None => format!("none submitted (recorded up to {:#x}, submitted up to {:#x} by {:?})", cell.recorded_max, cell.submitted_max, cell.submitted_queue.map(queue_id)),
+            };
+            rows.push(format!("q{}@{} waits {va:#x} >= {:#x} (done {done:#x}) <- {by}", queue_id(aw.waiting_queue), aw.wait_seq, aw.val));
+        }
+    }
+    for (&f, tf) in &graph.title_fences {
+        for &(val, q, seq) in &tf.waits {
+            let met = tf.signals.iter().find(|s| s.val >= val);
+            let by = match met {
+                Some(s) => format!("q{}@{} (signal {:#x})", queue_id(s.queue), s.seq, s.val),
+                None => "none submitted".to_string(),
+            };
+            rows.push(format!("q{}@{seq} waits title fence {f:#x} >= {val:#x} <- {by}", queue_id(q)));
+        }
+    }
+    rows.sort();
+    let n = rows.len();
+    rows.truncate(90);
+    format!("{n} waits: {}", rows.join("; "))
+}
+
 /// `queue` was made to wait for the fence of the cell at `va` to reach `value` (a bridged
 /// `Wait64BitValueX`): listed with XCL's own waits while it is unmet, whatever the sync graph
 /// has done with it since.
@@ -1621,6 +1659,10 @@ fn wake_sync_watchdog() {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
                 crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
                 crate::xlog_warn!("D3D12.X: queues behind during GPU wait timeout: {}", progress_summary());
+                static PRINTED: AtomicU64 = AtomicU64::new(0);
+                if PRINTED.fetch_add(1, Ordering::Relaxed) < 3 {
+                    crate::xlog_warn!("D3D12.X: wait edges at that time-out: {}", edges_summary());
+                }
             }
         });
     });
