@@ -1138,7 +1138,7 @@ static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex:
 pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D12Fence, value: u64) {
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
-    waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
+    waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
     waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
 }
 
@@ -1150,7 +1150,7 @@ fn internal_waits_summary() -> String {
             .flat_map(|m| m.iter())
             .flat_map(|(&q, waits)| waits.iter().map(move |w| (q, w)))
             .filter_map(|(q, w)| {
-                let done = unsafe { w.fence.GetCompletedValue() };
+                let done = unsafe { super::real::fence_completed(&w.fence) };
                 (done < w.value).then(|| (q, format!("{} >= {:#x} (done {done:#x}, {} ms)", w.what, w.value, w.at.elapsed().as_millis())))
             })
             .collect()
@@ -1176,7 +1176,7 @@ fn queue_id(q: usize) -> usize {
 /// was removed). Returns the fence's current completed value (or `0` if no fence exists yet).
 unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
     let Some(ref fence) = cell.fence else { return 0 };
-    let completed = fence.GetCompletedValue();
+    let completed = super::real::fence_completed(&fence);
     if completed == u64::MAX {
         let removed = cell.armed_waits.len();
         cell.armed_waits.clear();
@@ -1207,7 +1207,7 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
     }
     let p = fence_raw as *mut c_void;
     let Some(f) = ID3D12Fence::from_raw_borrowed(&p) else { return };
-    let completed = f.GetCompletedValue();
+    let completed = super::real::fence_completed(&f);
     if completed == u64::MAX {
         tf.waits.clear();
         tf.signals.clear();
@@ -2100,7 +2100,7 @@ struct CopyScratch {
 
 impl CopyScratch {
     fn idle(&mut self) -> bool {
-        self.marks.retain(|_, (fence, value)| unsafe { fence.GetCompletedValue() < *value });
+        self.marks.retain(|_, (fence, value)| unsafe { super::real::fence_completed(&fence) < *value });
         !self.untracked_submission && self.marks.is_empty()
     }
 }

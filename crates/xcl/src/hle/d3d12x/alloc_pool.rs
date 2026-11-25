@@ -32,7 +32,7 @@ struct Backing {
 
 impl Backing {
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+        self.users.is_empty() && self.marks.values().all(|(f, v)| super::real::fence_completed(&f) >= *v)
     }
 }
 

@@ -735,7 +735,7 @@ impl State {
     /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
     fn retire_free_pools(&mut self) {
         let now = std::time::Instant::now();
-        let done = unsafe { self.fence.GetCompletedValue() };
+        let done = unsafe { super::real::fence_completed(&self.fence) };
         self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
         if self.free.len() < POOL_TILES as usize {
             return;
@@ -907,13 +907,13 @@ impl State {
 
     #[inline]
     unsafe fn wait_for(&self, target: u64) {
-        if target == 0 || self.fence.GetCompletedValue() >= target {
+        if target == 0 || super::real::fence_completed(&self.fence) >= target {
             return;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+        if super::real::fence_completed(&self.fence) < target {
+            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", super::real::fence_completed(&self.fence));
         }
     }
 
@@ -922,7 +922,7 @@ impl State {
         if self.inflight.is_empty() {
             return;
         }
-        let completed = self.fence.GetCompletedValue();
+        let completed = super::real::fence_completed(&self.fence);
         while let Some(&(fv, end_pos)) = self.inflight.front() {
             if fv <= completed {
                 self.ring_free = end_pos;
@@ -939,7 +939,7 @@ impl State {
         let idx = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         let fv = self.slots[idx].fence_val;
-        if fv > 0 && self.fence.GetCompletedValue() < fv {
+        if fv > 0 && super::real::fence_completed(&self.fence) < fv {
             self.wait_for(fv);
             self.reclaim_ring();
         }
@@ -1150,16 +1150,22 @@ impl State {
                     (None, None) => return,
                 }
             };
-            if done_f.GetCompletedValue() < done_v {
-                if how == Drain::Finished || title_f.GetCompletedValue() < rb_v {
+            if super::real::fence_completed(&done_f) < done_v {
+                if how == Drain::Finished || super::real::fence_completed(&title_f) < rb_v {
                     i += 1;
                     continue;
                 }
                 // the title's lists are done: only the copy itself is left
+                // (briefly: the state's lock is held here, and every submit needs it; a copy that
+                // stands behind something else on its queue lands when it is done)
                 let _ = done_f.SetEventOnCompletion(done_v, self.event);
-                windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-                if done_f.GetCompletedValue() < done_v {
-                    crate::xlog_warn!("sparse: a copy back has not finished 5 s after the title's work it follows");
+                windows::Win32::System::Threading::WaitForSingleObject(self.event, 20);
+                if super::real::fence_completed(&done_f) < done_v {
+                    static LATE: AtomicU64 = AtomicU64::new(0);
+                    let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if k.is_power_of_two() {
+                        crate::xlog_warn!("sparse: {k} copies back so far not finished 20 ms after the title's work they follow – left for later");
+                    }
                     i += 1;
                     continue;
                 }

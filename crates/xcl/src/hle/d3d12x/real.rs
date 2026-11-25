@@ -6260,6 +6260,22 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     hr
 }
 
+/// GetCompletedValue of `fence` as the PC has it, without what the hook below does for the title
+/// on the way (it lands copies back, which takes the sparse state's lock): for XCL's own queries,
+/// the ones made with that lock held above all. With the hook, each such query stood ~2 ms
+/// trying for the lock its own thread held, and a pass over the pending copies took seconds
+/// with every submitting thread behind it.
+pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+    const PC_GET_COMPLETED_VALUE: usize = 8;
+    let p = fence.as_raw();
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
+        std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
+    } else {
+        std::mem::transmute(*(*(p as *const *const usize)).add(PC_GET_COMPLETED_VALUE))
+    };
+    f(p)
+}
+
 /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
 /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
 unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
