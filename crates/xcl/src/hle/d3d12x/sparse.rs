@@ -2139,49 +2139,94 @@ mod tests {
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
-            std::ptr::write_bytes(base as *mut u8, 0, 256);
+            std::ptr::write_bytes(base as *mut u8, 0, TILE);
 
-            // the title's queue: blocked on a fence nothing has signalled yet, then a copy of
-            // 0..64 into the tile (a GPU write the title's next CPU read expects)
-            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            // Queue A waits for the CPU while B writes a different range of the same tile.
+            // The CPU must see B's copy before releasing A, and then see A's later write.
+            const BYTES: usize = 256;
             let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate");
-            let mut up: Option<ID3D12Resource> = None;
-            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &{ let mut d = buffer_desc(256); d.Flags = D3D12_RESOURCE_FLAG_NONE; d }, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up)
-                .expect("upload buffer");
-            let up = up.expect("upload buffer");
-            let mut p: *mut c_void = std::ptr::null_mut();
-            up.Map(0, None, Some(&mut p)).expect("Map");
-            for i in 0..64u32 {
-                *(p as *mut u32).add(i as usize) = 0xC0DE_0000 | i;
-            }
-            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
-            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
-            list.CopyBufferRegion(&reserved, 0, &up, 0, 256);
-            list.Close().expect("close");
-            title.Wait(&s.fence, s.value).expect("wait for the tile mapping");
-            title.Wait(&gate, 1).expect("wait for the gate");
-            title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
-
+            let submit = |offset: usize, tag: u32, blocked: bool| {
+                let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+                let mut up: Option<ID3D12Resource> = None;
+                let desc = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_NONE, ..buffer_desc(BYTES as u64) };
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up)
+                    .expect("upload buffer");
+                let up = up.expect("upload buffer");
+                let mut p: *mut c_void = std::ptr::null_mut();
+                up.Map(0, None, Some(&mut p)).expect("Map");
+                for i in 0..BYTES / 4 {
+                    *p.cast::<u32>().add(i) = tag | i as u32;
+                }
+                up.Unmap(0, None);
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+                list.CopyBufferRegion(&reserved, offset as u64, &up, 0, BYTES as u64);
+                list.Close().expect("close");
+                title.Wait(&s.fence, s.value).expect("wait for the tile mapping");
+                if blocked {
+                    title.Wait(&gate, 1).expect("wait for the gate");
+                }
+                title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+                // Keep the allocator, list and upload buffer alive through GPU completion.
+                (title, alloc, list, up)
+            };
+            let first = submit(0, 0xA000_0000, true);
+            let second = submit(PAGE, 0xB000_0000, false);
+            // Signal after B's original write, before submitting its readback. If both
+            // direct queues share a blocked execution lane, B itself may be unable to run.
+            let b_uploaded: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("B upload fence");
+            second.0.Signal(&b_uploaded, 1).expect("B upload signal");
             let t0 = std::time::Instant::now();
-            s.after_execute(&title, &[(base, 256)], &[]);
+            s.after_execute(&first.0, &[(base, BYTES)], &[]);
             let took = t0.elapsed();
-            assert!(took < std::time::Duration::from_secs(1), "the copy back waited {took:?} for the title's queue");
-            s.drain_readbacks(Drain::Finished);
-            assert_eq!(*(base as *const u32), 0, "nothing lands before the title's work is done");
+            s.after_execute(&second.0, &[(base + PAGE, BYTES)], &[]);
 
-            // the title's queue goes on: the copy back lands once it is done
-            gate.Signal(1).expect("gate signal");
-            // as the title would: wait for its own work (here the fence its queue signalled)
-            if s.rb_fence.GetCompletedValue() < s.rb_value {
-                s.rb_fence.SetEventOnCompletion(s.rb_value, s.event).expect("SetEventOnCompletion");
-                windows::Win32::System::Threading::WaitForSingleObject(s.event, 5000);
+            // Observe the title's memory instead of assuming which private fence owns a copy.
+            let matches = |offset: usize, tag: u32| {
+                (0..BYTES / 4).all(|i| *((base + offset) as *const u32).add(i) == (tag | i as u32))
+            };
+            let land_until = |s: &mut State, offset, tag| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    s.drain_readbacks(Drain::Finished);
+                    if matches(offset, tag) { return true; }
+                    if std::time::Instant::now() >= deadline { return false; }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            };
+            let second_landed = land_until(&mut s, PAGE, 0xB000_0000);
+            let first_pending = s.rb_jobs.len() == 1;
+            let first_untouched = std::slice::from_raw_parts(base as *const u32, BYTES / 4).iter().all(|&v| v == 0);
+            let b_before_release = b_uploaded.GetCompletedValue();
+            gate.Signal(1).expect("release first queue");
+            let first_landed = land_until(&mut s, 0, 0xA000_0000);
+            let second_after_release = land_until(&mut s, PAGE, 0xB000_0000);
+            // A broken implementation may have consumed its readback job early. Its original
+            // upload still needs to finish before we release the D3D12 objects below.
+            for queue in [&first.0, &second.0] {
+                let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("completion fence");
+                queue.Signal(&done, 1).expect("queue completion");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while done.GetCompletedValue() < 1 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert_eq!(done.GetCompletedValue(), 1, "title queue completed");
             }
-            s.drain_readbacks(Drain::TitleDone);
-            for i in 0..64u32 {
-                assert_eq!(*(base as *const u32).add(i as usize), 0xC0DE_0000 | i, "dword {i} after the copy back");
+            assert!(took < std::time::Duration::from_secs(1), "the copy back waited {took:?} for the title's queue");
+            eprintln!("B upload fence before A release = {b_before_release}, B readback = {second_landed}, A pending = {first_pending}, A untouched = {first_untouched}");
+            assert!(b_before_release <= 1, "B upload fence reports device removal");
+            assert!(second_after_release, "B must publish all its words by the end");
+            assert!(first_landed, "A must publish all its words after the gate opens");
+            assert!(matches(PAGE, 0xB000_0000), "A must preserve B's earlier write");
+            assert!(s.rb_jobs.is_empty(), "both copies were consumed");
+            assert_eq!(s.rb_pool.len(), 2, "both buffers are kept for the next submission");
+            if b_before_release == 0 {
+                assert!(!second_landed, "B cannot publish a readback before its own fence");
+                crate::gpu::recomp::runner::skip_test("queue B's upload did not finish while A was gated; independent queue progress unverified");
+            } else {
+                assert!(second_landed, "B uploaded before A was released, so its readback must land independently");
+                assert!(first_pending && first_untouched, "B must not retire or publish A's readback");
             }
-            assert!(s.rb_jobs.is_empty(), "the copy back was consumed");
-            assert_eq!(s.rb_pool.len(), 1, "its buffer is kept for the next one");
             drop(s);
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
