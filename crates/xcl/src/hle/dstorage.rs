@@ -980,6 +980,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
+        crate::hle::kernelx::pagelog::note("DirectStorage write", r.destination as usize, 0, n);
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
     }
     Ok(())

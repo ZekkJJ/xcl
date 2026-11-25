@@ -219,6 +219,13 @@ struct RbJob {
     seq: u64,
 }
 
+/// In an immediate's byte count: the cell is a counter that the title's queues write in turn,
+/// with values that only rise as they are recorded. A list that runs late – a retail title's
+/// compute jobs, tens of frames after their recording when its submits are slow – writes an
+/// earlier value over a later one; the title's CPU waits for "at least" the later one, which
+/// was reached. The CPU's view keeps the larger value.
+pub(super) const IMM_KEEP_MAX: u8 = 0x80;
+
 /// Immediates the title's lists wrote into a window (`list_x::imm_by_cpu`): stored in the
 /// title's memory once `fence` reaches `value` (the lists are done on the GPU).
 struct ImmJob {
@@ -1151,12 +1158,22 @@ impl State {
         if !self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((pg - t) / PAGE)) == 0) {
             return;
         }
-        match bytes {
+        match bytes & 0x7f {
             4 => (*(va as *const std::sync::atomic::AtomicU32)).store(value as u32, Ordering::Release),
+            8 if bytes & IMM_KEEP_MAX != 0 => {
+                if (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel) > value {
+                    static LATE: AtomicU64 = AtomicU64::new(0);
+                    let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if k.is_power_of_two() {
+                        crate::xlog_info!("sparse: {k} immediates so far left out – their cell is a counter that held a later value ({value:#x} for {va:#x})");
+                    }
+                    return;
+                }
+            }
             8 => (*(va as *const AtomicU64)).store(value, Ordering::Release),
             _ => return,
         }
-        self.sync_sent_range(va, bytes as usize);
+        self.sync_sent_range(va, (bytes & 0x7f) as usize);
     }
 
     /// A copy back's list and a readback buffer of at least `need` bytes (reused when one fits)
@@ -1615,8 +1632,9 @@ impl State {
             if s.window_index(a).is_none() {
                 continue;
             }
-            if s.rbq.is_none() || ranges.iter().any(|&(ra, rn)| a < ra + rn && ra < a + n as usize) {
-                filtered.push((a, n as usize));
+            let len = (n & 0x7f) as usize;
+            if s.rbq.is_none() || ranges.iter().any(|&(ra, rn)| a < ra + rn && ra < a + len) {
+                filtered.push((a, len));
             } else {
                 imm.push((a, v, n));
             }

@@ -639,7 +639,7 @@ impl ListState {
 
     /// `note_write` for an immediate of `bytes` (4 or 8) into a window the GPU has a copy of
     fn note_imm(&mut self, va: u64, value: u64, bytes: u8) {
-        let end = va.saturating_add(bytes as u64);
+        let end = va.saturating_add((bytes & 0x7f) as u64);
         if self.written_ranges.len() < MAX_WRITTEN_RANGES {
             self.written_ranges.push((va, end));
         } else if let Some(last) = self.written_ranges.last_mut() {
@@ -2402,7 +2402,11 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     // into a window the GPU only has a copy of: the CPU's view gets the value from XCL
     if words.len() <= 2 && imm_by_cpu() && crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
         let value = words.iter().enumerate().fold(0u64, |v, (i, &w)| v | (w as u64) << (32 * i));
-        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, n as u8);
+        // a counter the title's queues write in turn (a `SyncCell` whose values only rose): a list
+        // that runs late does not take the CPU's view of it back (`sparse::IMM_KEEP_MAX`)
+        let counter = words.len() == 2 && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&va)).is_some_and(|c| !c.non_monotonic && c.recorded_max != 0);
+        let bytes = n as u8 | if counter { super::sparse::IMM_KEEP_MAX } else { 0 };
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, bytes);
     } else {
         note_write(list as usize, va, n);
     }

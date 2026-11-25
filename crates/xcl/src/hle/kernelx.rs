@@ -869,6 +869,64 @@ pub unsafe extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 /// video-memory tiles, they took the system's commit.)
 const PHYS_PAGE: usize = 0x1_0000;
 
+/// Diagnostic: the last events on the title's 64 KiB pages, for the report of an unhandled
+/// exception (`describe`): what happened lately at the pages the registers point into.
+pub mod pagelog {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    const KEEP: usize = 400_000;
+    const PAGE: usize = 0x1_0000;
+
+    #[derive(Clone, Copy)]
+    struct Event {
+        at_ms: u64,
+        what: &'static str,
+        /// the address the event is at, a second address (a move's source) and a number (page / bytes)
+        a: usize,
+        b: usize,
+        n: usize,
+    }
+
+    static LOG: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+    static COUNTS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+    fn now_ms() -> u64 {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// `what` happened at address `a` (`b`: another address it involves, `n`: a page number or bytes).
+    pub fn note(what: &'static str, a: usize, b: usize, n: usize) {
+        let mut g = LOG.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= KEEP {
+            g.pop_front();
+        }
+        g.push_back(Event { at_ms: now_ms(), what, a, b, n });
+        drop(g);
+        let mut c = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        match c.iter_mut().find(|e| e.0 == what) {
+            Some(e) => e.1 += 1,
+            None => c.push((what, 1)),
+        }
+    }
+
+    /// The events so far by kind.
+    pub fn counts() -> String {
+        let c = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        c.iter().map(|(w, n)| format!("{n} {w}")).collect::<Vec<_>>().join(", ")
+    }
+
+    /// The last events (up to 6) at the 64 KiB page of `addr`, newest first; empty: none kept.
+    pub fn describe(addr: usize) -> String {
+        let page = addr & !(PAGE - 1);
+        let Ok(g) = LOG.try_lock() else { return String::new() };
+        let now = now_ms();
+        let hit = |e: &&Event| (e.a..e.a + if e.what.starts_with("DirectStorage") { e.n.max(1) } else { PAGE }).contains(&addr) || e.a & !(PAGE - 1) == page || (e.b != 0 && e.b & !(PAGE - 1) == page);
+        g.iter().rev().filter(hit).take(6).map(|e| format!("{} ms ago: {} at {:#x}{}{}", now.saturating_sub(e.at_ms), e.what, e.a, if e.b != 0 { format!(" (other address {:#x})", e.b) } else { String::new() }, if e.n != 0 { format!(" [{:#x}]", e.n) } else { String::new() })).collect::<Vec<_>>().join("; ")
+    }
+}
+
 /// Size of one console physical page (64 KiB).
 pub const PHYS_PAGE_SIZE: usize = PHYS_PAGE;
 
@@ -998,6 +1056,7 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
     let mut page_off = offset;
     for addr in addrs {
         let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
+        pagelog::note("DirectStorage write by page number", addr + page_off, 0, chunk);
         std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (addr + page_off) as *mut u8, chunk);
         done += chunk;
         page_off = 0;
@@ -1150,8 +1209,10 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         away.page.remove(&page);
         // never used where it was mapped: its home still holds the page (zeros)
         if lazy::unmark(at) {
+            pagelog::note("page unmapped (never used there)", at, 0, page);
             return false;
         }
+        pagelog::note("page unmapped (copied home)", at, 0, page);
         // (a home this call has not given back yet is still committed)
         let own = page_home(page);
         let pending = away.gone.len();
@@ -1193,8 +1254,10 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     if lazy::unmark(old) {
         away.at.remove(&old);
         away.page.remove(&page);
+        pagelog::note("page mapped elsewhere, was never used here", old, at, page);
         return Ok(false);
     }
+    pagelog::note("page moved here from its other mapping (that one is given up)", at, old, page);
     // (a destination that cannot be committed leaves the page where it was, mapped as before)
     if !in_uma && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
         return Err(());
@@ -1259,6 +1322,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
                 note_mapping_at(at);
+                pagelog::note("page freed while mapped (the address keeps its bytes)", at, 0, *arr.add(i));
             }
         }
     }
@@ -1373,8 +1437,10 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             lazy::mark(at);
             away.at.insert(at, p);
             away.page.insert(p, at);
+            pagelog::note("page mapped (never used: zeros on first touch)", at, 0, p);
             continue;
         }
+        pagelog::note("page mapped (its bytes copied from home, or zeros)", at, 0, p);
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
