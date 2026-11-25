@@ -289,6 +289,7 @@ pub(super) struct Pair {
 
 /// Before the PC call of an op of console code on `list` (`pso`: its pipeline as bound).
 pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32; 3]) -> Option<Pair> {
+    super::queue_probe::op(list as usize, kind.name(), pso, size);
     if !on() || list.is_null() {
         return None;
     }

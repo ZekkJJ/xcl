@@ -35,6 +35,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    crate::hle::d3d12x::queue_probe::start();
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
@@ -47,6 +48,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut checkpoint = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -67,7 +69,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let [(local, local_budget), (non_local, non_local_budget)] = video.unwrap_or_default();
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
-                let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                let (pages, page_pools, deferred) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
                     "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
@@ -81,6 +83,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                if deferred != 0 {
+                    crate::xlog_info!("title texture backing: {deferred} bytes deferred");
+                }
                 if pso_memory {
                     let (shaders, unique, referenced, metadata) = crate::hle::d3d12x::real::pending_shader_memory();
                     let (built, failed, pending) = crate::hle::d3d12x::pso_async::counts();
@@ -93,6 +98,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     crate::xlog_info!("DXGI memory budgets: {} MiB local, {} MiB non-local", mb(local_budget), mb(non_local_budget));
                     let (slots, heaps) = crate::hle::d3d12x::vram::small_texture_backing_bytes();
                     crate::xlog_info!("small texture backing: {slots} bytes in assigned slots, {heaps} bytes in heaps");
+                }
+                if crate::hle::d3d12x::queue_probe::enabled() {
+                    checkpoint ^= 1;
+                    crate::hle::d3d12x::queue_probe::snapshot(if checkpoint == 0 {
+                        "queue-checkpoint-0.tsv"
+                    } else {
+                        "queue-checkpoint-1.tsv"
+                    });
                 }
                 last = now;
             }

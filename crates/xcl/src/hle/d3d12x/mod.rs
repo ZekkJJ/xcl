@@ -19,6 +19,7 @@ mod cpu_writes;
 mod fence_x;
 pub mod frame;
 mod gpu_profile;
+pub(crate) mod queue_probe;
 pub mod guard;
 mod late_release;
 pub mod layout;

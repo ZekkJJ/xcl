@@ -1739,7 +1739,10 @@ fn dispatch_with(
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        // every window (u2..u5) is `mem`, as in the heap above
+        for k in 2..6 {
+            list.SetComputeRootUnorderedAccessView(k, mem_buf.GetGPUVirtualAddress());
+        }
         // `reps` dispatches, each between two timestamps when `timed`
         let stamps = 2 * reps as u32;
         let queries = if timed {

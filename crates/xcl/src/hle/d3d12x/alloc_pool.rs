@@ -127,7 +127,7 @@ pub fn created_on(list: usize, raw: usize, ty: i32) {
 }
 
 /// `lists` were just submitted to `queue`.
-pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
+pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void], submission: u64) {
     if !enabled() || queue.is_null() {
         return;
     }
@@ -145,9 +145,10 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     let (fence, value) = {
         let (f, v) = s.fences.get_mut(&key).unwrap();
-        if q.Signal(&*f, *v + 1).is_err() {
-            return;
-        }
+        let signal = q.Signal(&*f, *v + 1);
+        super::queue_probe::signal("allocator-fence", key, f, submission, *v + 1,
+            signal.as_ref().err().map_or(0, |e| e.code().0));
+        if signal.is_err() { return; }
         *v += 1;
         (f.clone(), *v)
     };
@@ -399,7 +400,7 @@ mod tests {
             };
 
             queue.ExecuteCommandLists(&lists);
-            executed(queue.as_raw(), &[l]);
+            executed(queue.as_raw(), &[l], 0);
             done(1);
 
             // the title resets its allocator (through the hook: `real::alloc_reset`) …
@@ -408,7 +409,7 @@ mod tests {
             assert_ne!(second, a as usize, "the list still holds its recording: another PC allocator takes the place");
             // … and submits the recording again
             queue.ExecuteCommandLists(&lists);
-            executed(queue.as_raw(), &[l]);
+            executed(queue.as_raw(), &[l], 0);
             done(2);
             assert!(dev.GetDeviceRemovedReason().is_ok(), "the recording was still there");
 
@@ -420,7 +421,7 @@ mod tests {
             }), 0);
             list.Close().unwrap();
             queue.ExecuteCommandLists(&lists);
-            executed(queue.as_raw(), &[l]);
+            executed(queue.as_raw(), &[l], 0);
             done(3);
 
             // the next reset: the first PC allocator holds nothing now and is used again

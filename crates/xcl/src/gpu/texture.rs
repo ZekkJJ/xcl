@@ -303,10 +303,24 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
     }
     up.list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
+    let list: ID3D12CommandList = windows::core::Interface::cast(&up.list).map_err(err)?;
+    use crate::hle::d3d12x::queue_probe;
+    let id = queue_probe::submit("texture-upload", key, &[windows::core::Interface::as_raw(&list)]);
+    if id != 0 {
+        queue_probe::event("texture-upload-info", key, 0, id, total, planned.len() as u64);
+        for (index, copy, _) in &planned {
+            let (res, subs, _) = &items[*index];
+            queue_probe::event("texture-upload-target", key, windows::core::Interface::as_raw(res) as usize,
+                id, copy.total, subs.len() as u64);
+        }
+    }
+    queue.ExecuteCommandLists(&[Some(list)]);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    let signal = queue.Signal(&up.fence, up.value);
+    queue_probe::signal("texture-fence", key, &up.fence, id, up.value,
+        signal.as_ref().err().map_or(0, |e| e.code().0));
+    signal.map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device

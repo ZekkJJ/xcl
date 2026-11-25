@@ -247,7 +247,17 @@ enum Drain {
     TitleDone,
 }
 
+struct TitleAccess {
+    // Retain the queue while its pointer is a key for this fence.
+    _queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    submitted: u64,
+    ordered: u64,
+}
+
 struct State {
+    /// Title queue -> its latest potentially sparse-writing submission.
+    title_access: FxHashMap<usize, TitleAccess>,
     dev: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -294,8 +304,13 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
-    /// placed buffers → the pool tiles they use
-    buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// tile address → pool tile of decommitted tiles a placed buffer uses: they stay mapped in
+    /// their window until the buffer is gone. Memory committed there again is then the same for
+    /// the window (what shaders write) and the buffer (what an ExecuteIndirect or a copy of the
+    /// title reads); with a new tile in the window the buffer kept the old one, with old bytes
+    kept: FxHashMap<usize, (u32, u32)>,
+    /// placed buffers → the tiles they use (address, pool tile)
+    buffers: FxHashMap<usize, Vec<(usize, (u32, u32))>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -604,6 +619,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         mapped: FxHashMap::default(),
         pinned: FxHashMap::default(),
         parked: FxHashMap::default(),
+        kept: FxHashMap::default(),
         buffers: FxHashMap::default(),
         to_zero: Vec::new(),
         staging: None,
@@ -619,6 +635,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         rb_list,
         rb_last_fence: 0,
         waited: FxHashMap::default(),
+        title_access: FxHashMap::default(),
         runs: None,
         scratch_runs: Vec::new(),
     })
@@ -784,10 +801,11 @@ impl State {
 
     /// Map `tiles` (tile addresses) of `res` (starting at `res_base`) onto pool tiles,
     /// batched per pool heap with contiguous runs merged into single regions.
-    unsafe fn map_tiles(&self, res: &ID3D12Resource, res_base: usize, tiles: &[(usize, (u32, u32))]) {
+    unsafe fn map_tiles(&mut self, res: &ID3D12Resource, res_base: usize, tiles: &[(usize, (u32, u32))]) {
         if tiles.is_empty() {
             return;
         }
+        self.order_after_title();
         let mut by_heap: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
         for &(a, (h, t)) in tiles {
             by_heap.entry(h).or_default().push((((a - res_base) / TILE) as u32, t));
@@ -818,6 +836,10 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            super::queue_probe::event(
+                "sparse-map", self.queue.as_raw() as usize, res.as_raw() as usize,
+                0, pairs.len() as u64, coords.len() as u64,
+            );
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -833,10 +855,11 @@ impl State {
         }
     }
 
-    unsafe fn unmap_tiles(&self, res: &ID3D12Resource, res_base: usize, tiles: &[usize]) {
+    unsafe fn unmap_tiles(&mut self, res: &ID3D12Resource, res_base: usize, tiles: &[usize]) {
         if tiles.is_empty() {
             return;
         }
+        self.order_after_title();
         let mut xs: Vec<u32> = tiles.iter().map(|&a| ((a - res_base) / TILE) as u32).collect();
         xs.sort_unstable();
         let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::with_capacity(xs.len());
@@ -856,6 +879,10 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
+        super::queue_probe::event(
+            "sparse-unmap", self.queue.as_raw() as usize, res.as_raw() as usize,
+            0, tiles.len() as u64, coords.len() as u64,
+        );
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -868,6 +895,50 @@ impl State {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+    }
+
+    /// Put writes and mapping changes behind the title queues already using the windows.
+    unsafe fn order_after_title(&mut self) {
+        let queue = self.queue.as_raw() as usize;
+        for access in self.title_access.values_mut() {
+            if access.ordered < access.submitted {
+                // Keep the dependency explicit for the D3D12 debug layer even
+                // if GetCompletedValue would already report the producer done.
+                expect_queue_order(self.queue.Wait(&access.fence, access.submitted), "sparse wait for title access");
+                super::list_x::note_internal_wait(queue, "sparse write behind title access", &access.fence, access.submitted);
+                access.ordered = access.submitted;
+            }
+        }
+    }
+
+    unsafe fn order_after_sparse(&mut self, queue: &ID3D12CommandQueue) {
+        let key = queue.as_raw() as usize;
+        if self.waited.get(&key).copied().unwrap_or(0) < self.value {
+            expect_queue_order(queue.Wait(&self.fence, self.value), "title wait for sparse writes");
+            super::list_x::note_internal_wait(key, "sparse uploads and tile mappings", &self.fence, self.value);
+            self.waited.insert(key, self.value);
+        }
+    }
+
+    unsafe fn submit_title<R>(&mut self, queue: &ID3D12CommandQueue, submit: impl FnOnce() -> R) -> R {
+        let key = queue.as_raw() as usize;
+        if key == self.queue.as_raw() as usize {
+            return submit();
+        }
+        self.order_after_sparse(queue);
+        let access = self.title_access.entry(key).or_insert_with(|| TitleAccess {
+            _queue: queue.clone(),
+            fence: self.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("sparse title access fence"),
+            submitted: 0,
+            ordered: 0,
+        });
+        let result = submit();
+        access.submitted += 1;
+        let signal = queue.Signal(&access.fence, access.submitted);
+        super::queue_probe::signal("sparse-title-fence", key, &access.fence, 0, access.submitted,
+            signal.as_ref().err().map_or(0, |e| e.code().0));
+        expect_queue_order(signal, "title sparse access signal");
+        result
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -884,7 +955,7 @@ impl State {
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 // still mapped there: no new mapping, what it held is cleared
-                if let Some(tile) = self.parked.remove(&t) {
+                if let Some(tile) = self.parked.remove(&t).or_else(|| self.kept.remove(&t)) {
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                     self.runs = None;
                     self.to_zero.push((t, TILE));
@@ -928,7 +999,9 @@ impl State {
     #[inline]
     unsafe fn signal(&mut self) {
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let signal = self.queue.Signal(&self.fence, self.value);
+        super::queue_probe::signal("sparse-fence", self.queue.as_raw() as usize, &self.fence, 0, self.value,
+            signal.as_ref().err().map_or(0, |e| e.code().0));
     }
 
     #[inline]
@@ -993,7 +1066,9 @@ impl State {
         let closed = self.slots[idx].list.Close().is_ok();
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
+                self.order_after_title();
                 super::title_textures::own_work(|| {
+                    super::queue_probe::submit("sparse-upload", self.queue.as_raw() as usize, &[l.as_raw()]);
                     self.queue.ExecuteCommandLists(&[Some(l)]);
                 });
             }
@@ -1313,7 +1388,13 @@ impl State {
                 off += chunk;
             }
             if job.list.Close().is_ok() {
-                pc_execute(queue, &job.list);
+                if sparse_order_enabled() {
+                    // This path calls the native queue directly and bypasses
+                    // the title ExecuteCommandLists hook.
+                    self.submit_title(queue, || pc_execute(queue, &job.list));
+                } else {
+                    pc_execute(queue, &job.list);
+                }
             }
             job.rb_v = v;
             job.done_v = v;
@@ -1342,6 +1423,7 @@ impl State {
                 if s.rb_list.Close().is_ok() {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
+                            super::queue_probe::submit("sparse-readback", s.queue.as_raw() as usize, &[l.as_raw()]);
                             s.queue.ExecuteCommandLists(&[Some(l)]);
                         });
                     }
@@ -1819,9 +1901,18 @@ impl State {
         }
     }
 
-    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
-    fn release_if_unused(&mut self, tile: (u32, u32)) {
-        if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
+    /// A pool tile a buffer used at `t` goes back to the free list, unless its window maps it, it
+    /// is parked there, or another buffer uses it. Kept mapped for the buffer: parked from here on.
+    fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
+        if self.pinned.contains_key(&tile) {
+            return;
+        }
+        if self.kept.get(&t) == Some(&tile) {
+            self.kept.remove(&t);
+            self.parked.insert(t, tile);
+            return;
+        }
+        if self.mapped.get(&t).is_none_or(|e| e.pool != tile) && self.parked.get(&t) != Some(&tile) {
             self.free.push(tile);
         }
     }
@@ -1835,12 +1926,18 @@ impl State {
         }
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         for (t, tile) in std::mem::take(&mut self.parked) {
+            // (a placed buffer uses it)
+            if self.pinned.contains_key(&tile) {
+                self.kept.insert(t, tile);
+                continue;
+            }
             if let Some(wi) = self.window_index(t) {
                 by_window.entry(wi).or_default().push(t);
             }
-            if !self.pinned.contains_key(&tile) {
-                self.free.push(tile);
-            }
+            self.free.push(tile);
+        }
+        if by_window.is_empty() {
+            return false;
         }
         for (wi, ts) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
@@ -1972,6 +2069,34 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
 }
 
+fn expect_queue_order(result: windows::core::Result<()>, operation: &str) {
+    if let Err(error) = result {
+        super::real::stop_if_device_removed();
+        panic!("{operation} failed: {error}");
+    }
+}
+
+fn sparse_order_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("XCL_SPARSE_QUEUE_ORDER").is_some());
+    *ENABLED
+}
+
+/// Pair the native submission and its fence under the same lock as sparse mutations.
+/// The opt-in is isolated while forward title queue waits are being exercised.
+pub(super) unsafe fn ordered_submit<R>(raw: *mut c_void, submit: impl FnOnce() -> R) -> R {
+    if super::title_textures::is_own_work() {
+        return submit();
+    }
+    super::present::remember_queue(raw);
+    if !sparse_order_enabled() {
+        return submit();
+    }
+    let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&raw) else { return submit() };
+    let mut state = lock_state();
+    let Some(s) = state.as_mut() else { return submit() };
+    s.submit_title(queue, submit)
+}
+
 /// A buffer the title places at `va` in a sparse window (`bytes` long, `desc` the PC
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
@@ -2009,7 +2134,7 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    s.buffers.insert(raw as usize, tiles);
     s.signal();
     Some((hr, delta))
 }
@@ -2049,12 +2174,12 @@ pub fn forget_buffer(res: usize) {
 
 fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
+    for (address, tile) in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
             *c -= 1;
             if *c == 0 {
                 s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+                s.release_if_unused(address, tile);
             }
         }
     }
@@ -2063,6 +2188,107 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mappings_and_title_writes_wait_in_both_directions() {
+        use crate::gpu::fence::{self, FenceError};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory6};
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+
+        unsafe {
+            // Run this test on its own with the switch set because the debug
+            // layer must be configured before the process creates a device.
+            let validate = std::env::var_os("XCL_TEST_SPARSE_DEBUG").is_some();
+            if validate {
+                crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug)
+                    .expect("D3D12 debug layer").EnableDebugLayer();
+            }
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory6>() else {
+                crate::gpu::recomp::runner::skip_test("no DXGI factory");
+                return;
+            };
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, _)) = crate::gpu::adapter::candidates(&factory, &selector).into_iter().next() else {
+                crate::gpu::recomp::runner::skip_test("no selected adapter");
+                return;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            }
+            let dev = dev.unwrap();
+            let mut reserved = None;
+            if dev.CreateReservedResource(&buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_err() {
+                crate::gpu::recomp::runner::skip_test("no reserved buffers");
+                return;
+            }
+            let reserved: ID3D12Resource = reserved.unwrap();
+            let base = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let mut s = new_state(&dev, vec![(base, reserved.clone())]).expect("sparse state");
+            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("CPU gate");
+
+            let mut upload = None;
+            let desc = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_NONE, ..buffer_desc(4) };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut upload).expect("upload buffer");
+            let upload: ID3D12Resource = upload.unwrap();
+            let mut ptr = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut ptr)).expect("upload map");
+            *ptr.cast::<u32>() = 0x1234_5678;
+            upload.Unmap(0, None);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("title allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("title list");
+            list.CopyBufferRegion(&reserved, 0, &upload, 0, 4);
+            list.Close().expect("close title list");
+
+            // A title write queued while the initial mapping is blocked cannot overtake it.
+            s.queue.Wait(&gate, 1).expect("block initial mapping");
+            s.commit_range(base, TILE);
+            assert!(s.mapped.contains_key(&base));
+            s.submit_title(&title, || pc_execute(&title, &list));
+            let done = s.title_access[&(title.as_raw() as usize)].fence.clone();
+            let held_by_map = fence::wait(&done, 1, &dev, None, 100);
+            gate.Signal(1).expect("release initial mapping");
+            fence::wait(&done, 1, &dev, None, 5000).expect("title write completed");
+            assert!(matches!(held_by_map, Err(FenceError::Timeout(_))));
+            s.readback_ranges(&[(base, 4)]);
+            assert_eq!(*(base as *const u32), 0x1234_5678);
+
+            // A later unmap cannot overtake a blocked write to the previous mapping.
+            title.Wait(&gate, 2).expect("block title write");
+            s.submit_title(&title, || pc_execute(&title, &list));
+            s.decommit_range(base, TILE);
+            assert!(s.flush_parked());
+            let held_by_title = fence::wait(&s.fence, s.value, &dev, None, 100);
+            gate.Signal(2).expect("release title write");
+            fence::wait(&s.fence, s.value, &dev, None, 5000).expect("unmap completed");
+            assert!(matches!(held_by_title, Err(FenceError::Timeout(_))));
+            if validate {
+                let info: ID3D12InfoQueue = dev.cast().expect("D3D12 debug info queue");
+                let mut conflicts = 0;
+                for index in 0..info.GetNumStoredMessagesAllowedByRetrievalFilter() {
+                    let mut size = 0;
+                    info.GetMessage(index, None, &mut size).unwrap();
+                    let mut data = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+                    let msg = data.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    info.GetMessage(index, Some(msg), &mut size).unwrap();
+                    if (*msg).ID.0 == 1047 {
+                        conflicts += 1;
+                    }
+                    if (*msg).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        let text = std::ffi::CStr::from_ptr((*msg).pDescription.cast()).to_string_lossy();
+                        println!("sparse fixture debug error {}: {text}", (*msg).ID.0);
+                    }
+                }
+                println!("sparse fixture: byte-exact readback with {conflicts} D3D12 error 1047 messages");
+            }
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
 
     /// A copy back after a title submission does not wait for the title's queue: that queue can
     /// be waiting for work the title submits next, from the thread that is in here. The copy
@@ -2119,6 +2345,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2134,6 +2361,7 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+                title_access: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -2351,6 +2579,7 @@ mod tests {
                 free: Vec::new(),
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
@@ -2368,6 +2597,7 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+                title_access: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -2566,6 +2796,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2581,6 +2812,7 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+                title_access: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -2625,13 +2857,22 @@ mod tests {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
 
         unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory6>() else {
+                crate::gpu::recomp::runner::skip_test("no DXGI factory");
+                return;
+            };
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, desc)) = crate::gpu::adapter::candidates(&factory, &selector).into_iter().next() else {
+                crate::gpu::recomp::runner::skip_test("no selected adapter");
+                return;
+            };
             let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
-                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device on the selected adapter");
+                return;
             }
             let dev = dev.expect("D3D12 device");
+            eprintln!("sparse tile-lifetime GPU: {}", crate::gpu::adapter::name(&desc));
             let base = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
             assert!(base != 0 && base % TILE == 0);
             let mut reserved: Option<ID3D12Resource> = None;
@@ -2668,6 +2909,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2683,6 +2925,7 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+                title_access: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -2698,7 +2941,7 @@ mod tests {
             assert_eq!(s.parked.get(&base), Some(&tile));
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");
-            s.release_if_unused(tile);
+            s.release_if_unused(base, tile);
             assert!(!s.free.contains(&tile), "a parked tile is not free");
 
             // committed again: the same tile, cleared, no new mapping
@@ -2729,6 +2972,38 @@ mod tests {
             assert!(s.parked.is_empty());
             assert_eq!(s.mapped[&(base + TILE)].pool, tile);
             assert!(!s.mapped.contains_key(&base));
+
+            // a placed buffer uses the tile: the window keeps it when it is decommitted and
+            // flushed, memory committed there again is the buffer's, and it is free only once
+            // the buffer is gone and it was decommitted
+            let at = base + TILE;
+            let mut alias: Option<ID3D12Resource> = None;
+            s.dev.CreateReservedResource(&buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut alias)
+                .expect("placed buffer");
+            let alias = alias.expect("reserved alias");
+            let alias_id = alias.as_raw() as usize;
+            s.map_tiles(&alias, at, &[(at, tile)]);
+            s.signal();
+            s.buffers.insert(alias_id, vec![(at, tile)]);
+            *s.pinned.entry(tile).or_default() += 1;
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked(), "nothing to unmap");
+            assert_eq!(s.kept.get(&at), Some(&tile));
+            assert!(!s.free.contains(&tile));
+            let v = s.value;
+            s.to_zero.clear();
+            s.commit_range(at, TILE);
+            assert_eq!(s.mapped[&at].pool, tile, "the buffer's tile");
+            assert_eq!(s.to_zero, vec![(at, TILE)]);
+            assert_eq!(s.value, v, "no tile mapping changed");
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked());
+            s.wait_for(s.value);
+            drop(alias);
+            forget_in(&mut s, alias_id);
+            assert!(s.kept.is_empty() && !s.free.contains(&tile));
+            assert!(s.flush_parked());
+            assert!(s.free.contains(&tile));
 
             s.wait_for(s.value);
             drop(s);

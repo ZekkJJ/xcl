@@ -254,15 +254,16 @@ pub fn activity() -> (u64, u64) {
     (PRESENTS.load(Ordering::Relaxed), EXECUTES.load(Ordering::Relaxed))
 }
 
+pub(super) unsafe fn remember_queue(queue: *mut c_void) {
+    let mut queues = QUEUES.lock().unwrap();
+    if !queues.contains(&(queue as usize)) {
+        add_ref(queue as usize);
+        queues.push(queue as usize);
+    }
+}
+
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     EXECUTES.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut q = QUEUES.lock().unwrap();
-        if !q.contains(&(queue as usize)) {
-            add_ref(queue as usize);
-            q.push(queue as usize);
-        }
-    }
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
@@ -733,11 +734,15 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let qraw = queue as *mut c_void;
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
+    let id = super::queue_probe::submit("present-copy", queue, &[cl.as_raw()]);
     q.ExecuteCommandLists(&[Some(cl)]);
     p.copy_source = Some(src);
     p.dumps = dumps;
     p.value += 1;
-    if let Err(e) = q.Signal(&p.fence, p.value) {
+    let signal = q.Signal(&p.fence, p.value);
+    super::queue_probe::signal("present-fence", queue, &p.fence, id, p.value,
+        signal.as_ref().err().map_or(0, |e| e.code().0));
+    if let Err(e) = signal {
         // The copy is already submitted. Without its signal, keep its resources and allocator.
         p.disabled = true;
         let e = fence::api_error(&p.dev, "Signal", e);
@@ -778,11 +783,23 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static LATE: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let frame = PRESENTS.load(Ordering::Relaxed);
+    // XCL_FRAME_DUMP_LATE=<first frame>,<interval> increases capture density near a known transition.
+    if let Some((first, interval)) = *LATE.get_or_init(|| {
+        let value = std::env::var("XCL_FRAME_DUMP_LATE").ok()?;
+        let (first, interval) = value.split_once(',')?;
+        Some((first.parse().ok()?, interval.parse::<u64>().ok().filter(|&n| n != 0)?))
+    }) {
+        if frame >= first {
+            return (frame - first) % interval == 0;
+        }
+    }
     let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    every > 0 && frame % every == 20.min(every - 1)
 }
 
 /// Frames shown so far.

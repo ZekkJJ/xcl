@@ -441,6 +441,17 @@ fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
 }
 
+/// (tests) The view heaps XCL counts as bound on `list`; forgetting the list with `forget`.
+#[cfg(test)]
+pub(super) fn bound_heaps(list: *mut c_void, forget: bool) -> Vec<usize> {
+    let mut heaps = Vec::new();
+    with_bindings(list, |b| heaps = b.heaps.clone());
+    if forget {
+        LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+    }
+    heaps
+}
+
 const PC_IA_SET_PRIMITIVE_TOPOLOGY: usize = 20;
 const PC_RS_SET_VIEWPORTS: usize = 21;
 const PC_RS_SET_SCISSOR_RECTS: usize = 22;
@@ -1170,7 +1181,7 @@ unsafe impl Send for Progress {}
 static PROGRESS: Mutex<Option<HashMap<usize, Progress>>> = Mutex::new(None);
 
 /// After a submit to `queue`: a Signal of its private progress fence.
-pub(super) unsafe fn note_submitted(queue: *mut c_void) {
+pub(super) unsafe fn note_submitted(queue: *mut c_void, submission: u64) {
     if queue.is_null() {
         return;
     }
@@ -1188,7 +1199,10 @@ pub(super) unsafe fn note_submitted(queue: *mut c_void) {
     }
     let p = m.get_mut(&(queue as usize)).unwrap();
     p.submitted += 1;
-    if q.Signal(&p.fence, p.submitted).is_ok() {
+    let signal = q.Signal(&p.fence, p.submitted);
+    super::queue_probe::signal("progress-fence", queue as usize, &p.fence, submission, p.submitted,
+        signal.as_ref().err().map_or(0, |e| e.code().0));
+    if signal.is_ok() {
         p.recent.push_back((p.submitted, Instant::now()));
         while p.recent.len() > 4096 {
             p.recent.pop_front();
@@ -1264,6 +1278,7 @@ fn note_cell_wait(queue: usize, va: u64, fence: &ID3D12Fence, value: u64) {
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
     waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
+    super::queue_probe::event("Wait64 cell", queue, fence.as_raw() as usize, 0, value, va as u64);
     waits.push(InternalWait { what: "Wait64 cell", va, fence: fence.clone(), value, at: Instant::now() });
 }
 
@@ -1274,6 +1289,7 @@ pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D1
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
     waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
+    super::queue_probe::event(what, queue, fence.as_raw() as usize, 0, value, 0);
     waits.push(InternalWait { what, va: 0, fence: fence.clone(), value, at: Instant::now() });
 }
 
@@ -3211,13 +3227,15 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
-                exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                let id = super::queue_probe::submit("kickoff-prior", q_raw as usize, chunk);
+                super::sparse::ordered_submit(q_raw, || exec(q_raw, chunk.len() as u32, chunk.as_ptr()));
+                super::queue_probe::event("execute-return", q_raw as usize, 0, id, 0, 0);
                 copy_scratch_submitted(q_raw, chunk);
-                super::alloc_pool::executed(q_raw, chunk);
+                super::alloc_pool::executed(q_raw, chunk, id);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
                 cpu_writes_after(q_raw, chunk);
-                note_submitted(q_raw);
+                note_submitted(q_raw, id);
             });
             super::title_textures::submitted(prior);
             for &p in prior {
@@ -3231,9 +3249,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    let id = super::queue_probe::submit("kickoff", q_raw as usize, &one);
+    super::sparse::ordered_submit(q_raw, || exec(q_raw, 1, one.as_ptr()));
+    super::queue_probe::event("execute-return", q_raw as usize, 0, id, 0, 0);
     copy_scratch_submitted(q_raw, &one);
-    super::alloc_pool::executed(q_raw, &one);
+    super::alloc_pool::executed(q_raw, &one, id);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
